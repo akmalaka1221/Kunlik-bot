@@ -1,25 +1,32 @@
 import asyncio, json, logging, os, sqlite3, uuid
+import aiohttp
 from html import escape as esc
 from datetime import datetime, date, time, timedelta
 from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message, CallbackQuery, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton as B
-from google import genai
-from google.genai import types
+from aiogram.types import (Message, CallbackQuery, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton as B,
+                           ReplyKeyboardMarkup, KeyboardButton as KB)
 
-for _k in ("BOT_TOKEN", "GEMINI_API_KEY"):
-    if not os.getenv(_k, "").strip():
-        raise SystemExit(f"XATO: Railway > Variables bo'limida {_k} kiritilmagan!")
-TOKEN = os.environ["BOT_TOKEN"].strip()
+def env(k): return os.getenv(k, "").strip()
+TOKEN, CLAUDE_KEY, GEMINI_KEY, GROQ_KEY = env("BOT_TOKEN"), env("ANTHROPIC_API_KEY"), env("GEMINI_API_KEY"), env("GROQ_API_KEY")
+if not TOKEN: raise SystemExit("XATO: Railway > Variables bo'limida BOT_TOKEN kiritilmagan!")
+if not (CLAUDE_KEY or GEMINI_KEY): raise SystemExit("XATO: ANTHROPIC_API_KEY (yoki GEMINI_API_KEY) kiritilmagan!")
+CLAUDE_MODEL = env("CLAUDE_MODEL") or "claude-haiku-4-5"
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Asia/Tashkent"))
 MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
 DB = os.getenv("DB_PATH", "/app/data/tasks.db" if os.path.isdir("/app") else "data/tasks.db")
 
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
-ai = genai.Client(api_key=os.environ["GEMINI_API_KEY"].strip())
+if CLAUDE_KEY:
+    from anthropic import AsyncAnthropic
+    claude = AsyncAnthropic(api_key=CLAUDE_KEY)
+if GEMINI_KEY:
+    from google import genai
+    from google.genai import types
+    ai = genai.Client(api_key=GEMINI_KEY)
 
 # ---------- DB ----------
 os.makedirs(os.path.dirname(DB) or ".", exist_ok=True)
@@ -155,12 +162,39 @@ Mavjud vazifa: {json.dumps(task, ensure_ascii=False)}
 {src} shu vazifaga o'zgartirish so'ralgan. Faqat so'ralgan maydonlarni o'zgartir, qolganini aynan saqla.
 Faqat JSON qaytar: {{"title":"","date":"YYYY-MM-DD","time":"HH:MM yoki null","remind":[...] yoki null,"repeat":"none|daily|weekdays|weekly"}}"""
 
+def to_json(txt):
+    return json.loads(txt[txt.find("{"):txt.rfind("}") + 1])
+
 async def ask(prompt, audio=None, mime="audio/ogg"):
+    """Matn tahlili: Claude bo'lsa Claude, aks holda Gemini."""
+    if CLAUDE_KEY:
+        r = await claude.messages.create(model=CLAUDE_MODEL, max_tokens=1500, temperature=0,
+                                         messages=[{"role": "user", "content": prompt + "\nFaqat JSON yoz, boshqa hech narsa yozma."}])
+        return to_json(r.content[0].text)
     parts = [types.Part.from_bytes(data=audio, mime_type=mime)] if audio else []
     r = await ai.aio.models.generate_content(
         model=MODEL, contents=parts + [prompt],
         config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0))
-    return json.loads(r.text)
+    return to_json(r.text)
+
+async def transcribe(audio, mime):
+    """Ovozni matnga o'girish: Groq Whisper (bepul) yoki Gemini."""
+    if GROQ_KEY:
+        fd = aiohttp.FormData()
+        fd.add_field("file", audio, filename="voice.ogg", content_type=mime)
+        fd.add_field("model", env("GROQ_MODEL") or "whisper-large-v3")
+        fd.add_field("language", "uz")
+        async with aiohttp.ClientSession() as ses:
+            async with ses.post("https://api.groq.com/openai/v1/audio/transcriptions", data=fd,
+                                headers={"Authorization": f"Bearer {GROQ_KEY}"}) as r:
+                j = await r.json(content_type=None)
+                if r.status != 200: raise RuntimeError(f"Groq: {j}")
+                return j["text"].strip()
+    if GEMINI_KEY:
+        r = await ai.aio.models.generate_content(model=MODEL, contents=[
+            types.Part.from_bytes(data=audio, mime_type=mime), "Bu ovozni o'zbekcha matnga aynan o'gir. Faqat matnni yoz."])
+        return r.text.strip()
+    raise RuntimeError("Ovozli xabar uchun Railway'da GROQ_API_KEY kiriting")
 
 def parse_hm(s):
     h, m = s.strip().split(":"); return time(int(h), int(m)).strftime("%H:%M")
@@ -181,58 +215,59 @@ DRAFT = {}
 dp.message.filter(lambda m: m.from_user.id == owner() or (not owner() and (m.text or "").startswith("/start")))
 dp.callback_query.filter(lambda c: c.from_user.id == owner())
 
-HELP = """👋 Vazifalarni <b>matn yoki ovoz</b> bilan yuboring, masalan:
+BT_TODAY, BT_TOM, BT_WEEK, BT_REP, BT_SET, BT_HELP = "📋 Bugun", "📅 Ertaga", "🗓 Hafta", "📊 Hisobot", "⚙️ Sozlamalar", "❓ Yordam"
+MENU = ReplyKeyboardMarkup(keyboard=[[KB(text=BT_TODAY), KB(text=BT_TOM), KB(text=BT_WEEK)],
+                                     [KB(text=BT_REP), KB(text=BT_SET), KB(text=BT_HELP)]],
+                           resize_keyboard=True, is_persistent=True,
+                           input_field_placeholder="Vazifani yozing yoki ovozli yuboring...")
+
+HELP = """👋 <b>Vazifa qo'shish:</b> shunchaki yozing yoki 🎤 ovozli xabar yuboring, masalan:
 <i>«Ertaga 10 da mijoz bilan uchrashuv, 30 daqiqa oldin eslat. Har kuni 9 da reels joylash»</i>
 
-/bugun · /ertaga · /hafta — ro'yxatlar
-/hisobot — haftalik natija
-/sozlamalar — eslatma vaqtlari
-/bekor — tahrirlashni bekor qilish"""
-
+Pastdagi tugmalar:
+📋 Bugun · 📅 Ertaga · 🗓 Hafta — ro'yxatlar (raqamni bossangiz, vazifani o'zgartirish/o'chirish mumkin)
+📊 Hisobot — haftalik natija
+⚙️ Sozlamalar — eslatma vaqtlari"""
 @dp.message(Command("start", "help"))
+@dp.message(F.text == BT_HELP)
 async def start(m: Message):
     if not owner():
         setkv("owner", m.from_user.id)
         await m.answer("🔐 Bot sizga biriktirildi. Endi boshqalar undan foydalana olmaydi.")
-    await m.answer(HELP)
+    await m.answer(HELP, reply_markup=MENU)
 
 @dp.message(Command("bekor"))
 async def cancel(m: Message):
     state["edit"] = None; await m.answer("Bekor qilindi.")
 
-@dp.message(Command("bugun", "ertaga"))
-async def day_list(m: Message, command: CommandObject):
-    d = today() + timedelta(days=command.command == "ertaga")
+@dp.message(F.text.in_({BT_TODAY, BT_TOM}))
+async def day_list(m: Message):
+    d = today() + timedelta(days=m.text == BT_TOM)
     rows = tasks_on(d.isoformat())
     await m.answer(f"📋 <b>{ddmm(d.isoformat())}</b>\n" + (listing(rows) or "Vazifa yo'q."), reply_markup=list_kb(rows))
 
-@dp.message(Command("hafta"))
+@dp.message(F.text == BT_WEEK)
 async def week_list(m: Message):
     rows = db.execute("SELECT * FROM tasks WHERE status='pending' AND d BETWEEN ? AND ? ORDER BY d, t IS NULL, t",
                       (today().isoformat(), (today() + timedelta(days=6)).isoformat())).fetchall()
     await m.answer("📋 <b>7 kunlik reja</b>" + (listing(rows, True) or "\nVazifa yo'q."), reply_markup=list_kb(rows))
 
-@dp.message(Command("hisobot"))
+@dp.message(F.text == BT_REP)
 async def rep_cmd(m: Message): await m.answer(report())
 
-@dp.message(Command("sozlamalar"))
-async def settings(m: Message):
-    await m.answer(f"⚙️ Ertalabki xulosa: <b>{kv('morning', '08:00')}</b>\n"
-                   f"Kechki reja eslatmasi: <b>{kv('evening', '21:00')}</b>\n"
-                   f"Standart eslatma: <b>{kv('lead', '15')} daqiqa</b> oldin\n\n"
-                   "O'zgartirish: /ertalab 07:30 · /kechqurun 21:30 · /oldin 20")
+SET_OPTS = {"morning": ("☀️ Ertalabki xulosa vaqti", ["06:00", "06:30", "07:00", "07:30", "08:00", "08:30", "09:00", "10:00"]),
+            "evening": ("🌙 Kechki reja eslatmasi", ["19:00", "20:00", "20:30", "21:00", "21:30", "22:00", "22:30", "23:00"]),
+            "lead": ("🔔 Standart eslatma (daqiqa oldin)", ["5", "10", "15", "20", "30", "60", "120"])}
 
-@dp.message(Command("ertalab", "kechqurun", "oldin"))
-async def set_cmd(m: Message, command: CommandObject):
-    try:
-        a = command.args or ""
-        if command.command == "oldin":
-            v = int(a); assert 0 <= v <= 1440; setkv("lead", v)
-        else:
-            setkv("morning" if command.command == "ertalab" else "evening", parse_hm(a))
-        await m.answer("✅ Saqlandi")
-    except Exception:
-        await m.answer("Format: /ertalab 07:30 · /kechqurun 21:00 · /oldin 15")
+def settings_view():
+    txt = (f"⚙️ <b>Sozlamalar</b>\n\n☀️ Ertalabki xulosa: <b>{kv('morning', '08:00')}</b>\n"
+           f"🌙 Kechki reja eslatmasi: <b>{kv('evening', '21:00')}</b>\n"
+           f"🔔 Standart eslatma: <b>{kv('lead', '15')} daqiqa</b> oldin\n\nO'zgartirish uchun bosing:")
+    return txt, kb([("☀️ Ertalab vaqti", "sm:morning")], [("🌙 Kechki vaqt", "sm:evening")], [("🔔 Eslatma vaqti", "sm:lead")])
+
+@dp.message(F.text == BT_SET)
+async def settings(m: Message):
+    txt, k = settings_view(); await m.answer(txt, reply_markup=k)
 
 @dp.message(F.voice | F.audio)
 async def on_voice(m: Message):
@@ -240,24 +275,30 @@ async def on_voice(m: Message):
     buf = await bot.download(v.file_id)
     await process(m, audio=buf.read(), mime=v.mime_type or "audio/ogg")
 
-@dp.message(F.text & ~F.text.startswith("/"))
+@dp.message(F.text & ~F.text.startswith("/") & ~F.text.in_(set(BTNS := [BT_TODAY, BT_TOM, BT_WEEK, BT_REP, BT_SET, BT_HELP])))
 async def on_text(m: Message): await process(m, text=m.text)
 
 async def process(m: Message, text=None, audio=None, mime="audio/ogg"):
     w = await m.answer("⏳ Tahlil qilinmoqda...")
     tid, state["edit"] = state["edit"], None
+    heard_txt = None
     try:
+        if audio and CLAUDE_KEY:
+            heard_txt = await transcribe(audio, mime)
+            if not heard_txt: return await w.edit_text("🤔 Ovozdan hech narsa eshitilmadi.")
+            text, audio = heard_txt, None
         if tid and (r := row(tid)):
             new = clean(await ask(edit_prompt(tdict(r), text), audio, mime))
             update_task(tid, new)
             return await w.edit_text("✏️ Yangilandi:\n" + card(new), reply_markup=task_kb(tid))
         res = await ask(create_prompt(text), audio, mime)
         tasks = [clean(t) for t in res.get("tasks", [])]
-    except Exception:
+    except Exception as e:
         logging.exception("AI")
         state["edit"] = tid
-        return await w.edit_text("❗ Tushunmadim yoki AI xatosi. Qaytadan yuboring.")
-    heard = f"🎙 <i>{esc(res.get('transcript') or '')}</i>\n\n" if audio and res.get("transcript") else ""
+        return await w.edit_text(f"❗ Xatolik. Qaytadan yuboring.\n\n<code>{esc(type(e).__name__ + ': ' + str(e))[:300]}</code>")
+    tr = heard_txt or (res.get("transcript") if audio else None)
+    heard = f"🎙 <i>{esc(tr)}</i>\n\n" if tr else ""
     if not tasks:
         return await w.edit_text(heard + "🤔 Vazifa topilmadi.")
     k = uuid.uuid4().hex[:8]; DRAFT[k] = tasks
@@ -277,6 +318,18 @@ async def cb(c: CallbackQuery):
         if not ts: return await c.answer("Eskirgan, qayta yuboring")
         for t in ts: add_task(t)
         await mark(f"✅ Saqlandi ({len(ts)} ta)")
+    elif act == "sm":
+        title, opts = SET_OPTS[arg]
+        btn = [(o + (" daq" if arg == "lead" else ""), f"st:{arg}={o}") for o in opts]
+        await c.message.edit_text(f"{title} — tanlang:", reply_markup=kb(*[btn[i:i + 4] for i in range(0, len(btn), 4)],
+                                                                         [("⬅️ Orqaga", "sb:0")]))
+    elif act == "st":
+        k, v = arg.split("="); setkv(k, v)
+        txt, k2 = settings_view(); await c.message.edit_text("✅ Saqlandi\n\n" + txt, reply_markup=k2)
+    elif act == "sb":
+        txt, k2 = settings_view(); await c.message.edit_text(txt, reply_markup=k2)
+    elif act == "ec":
+        state["edit"] = None; await c.message.edit_text("Tahrirlash bekor qilindi.")
     elif act == "cx":
         DRAFT.pop(arg, None); await c.message.edit_text("❌ Bekor qilindi")
     else:
@@ -304,7 +357,8 @@ async def cb(c: CallbackQuery):
         elif act == "ed":
             state["edit"] = tid
             await c.message.answer(f"✏️ <b>{esc(r['title'])}</b>\nNimani o'zgartiramiz? Matn yoki ovoz yuboring.\n"
-                                   "<i>Masalan: «vaqtini 15:00 ga, 1 soat oldin eslat»</i>\nBekor: /bekor")
+                                   "<i>Masalan: «vaqtini 15:00 ga, 1 soat oldin eslat»</i>",
+                                   reply_markup=kb([("❌ Bekor qilish", "ec:0")]))
     await c.answer()
 
 # ---------- Rejalashtiruvchi ----------
@@ -368,9 +422,7 @@ async def ticker():
 
 async def main():
     logging.basicConfig(level=logging.INFO)
-    await bot.set_my_commands([BotCommand(command=c, description=d) for c, d in [
-        ("bugun", "Bugungi vazifalar"), ("ertaga", "Ertangi vazifalar"), ("hafta", "7 kunlik reja"),
-        ("hisobot", "Haftalik hisobot"), ("sozlamalar", "Sozlamalar"), ("bekor", "Tahrirni bekor qilish")]])
+    await bot.set_my_commands([BotCommand(command="start", description="Menyuni ochish")])
     bg = asyncio.create_task(ticker())  # noqa
     await dp.start_polling(bot)
 
