@@ -168,7 +168,7 @@ def to_json(txt):
 async def ask(prompt, audio=None, mime="audio/ogg"):
     """Matn tahlili: Claude bo'lsa Claude, aks holda Gemini."""
     if CLAUDE_KEY:
-        r = await claude.messages.create(model=CLAUDE_MODEL, max_tokens=1500, temperature=0,
+        r = await claude.messages.create(model=CLAUDE_MODEL, max_tokens=1500,
                                          messages=[{"role": "user", "content": prompt + "\nFaqat JSON yoz, boshqa hech narsa yozma."}])
         return to_json(r.content[0].text)
     parts = [types.Part.from_bytes(data=audio, mime_type=mime)] if audio else []
